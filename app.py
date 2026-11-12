@@ -1,34 +1,59 @@
 import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
-os.environ["TF_NUM_INTEROP_THREADS"] = "1"
-
-import gc
 import io
 import base64
 import numpy as np
-import tensorflow as tf
+from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image, ImageOps, ImageFilter
 from flask import Flask, request, jsonify, send_file
 
-# Evitar contención de hilos en el CPU compartido de Render
-tf.config.threading.set_intra_op_parallelism_threads(1)
-tf.config.threading.set_inter_op_parallelism_threads(1)
-
 app = Flask(__name__)
 
-# Cargar el modelo sin optimizador y compilar inferencia en grafo estático
-model = tf.keras.models.load_model("mi_modelo.h5", compile=False)
+# Cargar los pesos exactos exportados desde mi_modelo.h5
+_data = np.load("pesos_modelo.npz", allow_pickle=False)
+_num_layers = int(_data["num_layers"])
+CAPAS = []
+for i in range(_num_layers):
+    tipo = str(_data[f"type_{i}"])
+    if tipo == "Conv2D":
+        CAPAS.append(("Conv2D", _data[f"w_{i}"], _data[f"b_{i}"], str(_data[f"pad_{i}"])))
+    elif tipo == "MaxPooling2D":
+        CAPAS.append(("MaxPooling2D", tuple(_data[f"pool_{i}"])))
+    elif tipo == "Flatten":
+        CAPAS.append(("Flatten",))
+    elif tipo == "Dense":
+        CAPAS.append(("Dense", _data[f"w_{i}"], _data[f"b_{i}"], str(_data[f"act_{i}"])))
 
-@tf.function(reduce_retracing=True)
-def inferir(x):
-    return model(x, training=False)
 
-# Calentamiento inicial y liberación de memoria temporal
-_ = inferir(tf.zeros((1, 28, 28, 1), dtype=tf.float32))
-gc.collect()
+def inferir_cnn(img_28_norm):
+    x = img_28_norm.reshape(28, 28, 1).astype(np.float32)
+    for capa in CAPAS:
+        tipo = capa[0]
+        if tipo == "Conv2D":
+            _, w, b, pad = capa
+            kh, kw, _, _ = w.shape
+            if pad == "same":
+                x_in = np.pad(x, ((kh // 2, kh // 2), (kw // 2, kw // 2), (0, 0)), mode="constant")
+            else:
+                x_in = x
+            ventanas = sliding_window_view(x_in, (kh, kw), axis=(0, 1))
+            x = np.tensordot(ventanas, w, axes=([2, 3, 4], [2, 0, 1])) + b
+            x = np.maximum(0.0, x)
+        elif tipo == "MaxPooling2D":
+            _, (ph, pw) = capa
+            h, w_dim, c = x.shape
+            x = x[:(h // ph) * ph, :(w_dim // pw) * pw, :]
+            x = x.reshape(h // ph, ph, w_dim // pw, pw, c).max(axis=(1, 3))
+        elif tipo == "Flatten":
+            x = x.reshape(-1)
+        elif tipo == "Dense":
+            _, w, b, act = capa
+            x = x @ w + b
+            if act == "relu":
+                x = np.maximum(0.0, x)
+            elif act == "softmax":
+                exp_x = np.exp(x - np.max(x))
+                x = exp_x / np.sum(exp_x)
+    return x
 
 
 def calcular_otsu(gray_uint8):
@@ -208,8 +233,7 @@ def predict():
             "img_28": img_28_b64
         })
 
-    img_input = tf.convert_to_tensor(img_array.reshape(1, 28, 28, 1), dtype=tf.float32)
-    probs = inferir(img_input).numpy()[0]
+    probs = inferir_cnn(img_array)
 
     digito = int(np.argmax(probs))
     confianza = float(np.max(probs)) * 100.0
