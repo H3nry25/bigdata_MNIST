@@ -1,7 +1,11 @@
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # Ahorra ~90 MB de RAM en Render
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
 
+import gc
 import io
 import base64
 import numpy as np
@@ -9,11 +13,22 @@ import tensorflow as tf
 from PIL import Image, ImageOps, ImageFilter
 from flask import Flask, request, jsonify, send_file
 
+# Evitar contención de hilos en el CPU compartido de Render
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+
 app = Flask(__name__)
 
-# Cargar el modelo una sola vez y hacer calentamiento inicial
+# Cargar el modelo sin optimizador y compilar inferencia en grafo estático
 model = tf.keras.models.load_model("mi_modelo.h5", compile=False)
-_ = model(np.zeros((1, 28, 28, 1), dtype=np.float32), training=False)
+
+@tf.function(reduce_retracing=True)
+def inferir(x):
+    return model(x, training=False)
+
+# Calentamiento inicial y liberación de memoria temporal
+_ = inferir(tf.zeros((1, 28, 28, 1), dtype=tf.float32))
+gc.collect()
 
 
 def calcular_otsu(gray_uint8):
@@ -163,7 +178,7 @@ def predict():
         return jsonify({"error": "No se recibió ninguna imagen."}), 400
 
     try:
-        header, encoded = data["image"].split(",", 1)
+        _, encoded = data["image"].split(",", 1)
         img_bytes = base64.b64decode(encoded)
         image = Image.open(io.BytesIO(img_bytes))
     except Exception:
@@ -182,7 +197,6 @@ def predict():
 
     img_array = np.array(img_28, dtype=np.float32) / 255.0
 
-    # Convertir la miniatura 28x28 a base64 para mostrarla en la web
     buf = io.BytesIO()
     img_28.save(buf, format="PNG")
     img_28_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -194,8 +208,8 @@ def predict():
             "img_28": img_28_b64
         })
 
-    img_input = img_array.reshape(1, 28, 28, 1)
-    probs = model(img_input, training=False).numpy()[0]
+    img_input = tf.convert_to_tensor(img_array.reshape(1, 28, 28, 1), dtype=tf.float32)
+    probs = inferir(img_input).numpy()[0]
 
     digito = int(np.argmax(probs))
     confianza = float(np.max(probs)) * 100.0

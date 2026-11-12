@@ -97,9 +97,7 @@
     <hr />
 
     <div class="grid">
-      <!-- COLUMNA IZQUIERDA -->
       <div class="panel">
-        <!-- MODO 1: PIZARRA -->
         <div id="sec-pizarra">
           <h2>Dibuja un dígito (0-9)</h2>
           <div class="canvas-wrap">
@@ -111,7 +109,6 @@
           </div>
         </div>
 
-        <!-- MODO 2: SUBIR IMAGEN -->
         <div id="sec-subir" class="hidden">
           <h2>Sube una imagen</h2>
           <input type="file" id="file-input" accept="image/png, image/jpeg, image/jpg" onchange="cargarArchivo(event)" />
@@ -127,7 +124,6 @@
           <button class="btn btn-primary" id="btn-pred-archivo" onclick="predecirArchivo()">🔍 Predecir Imagen</button>
         </div>
 
-        <!-- MODO 3: CÁMARA -->
         <div id="sec-camara" class="hidden">
           <h2>Captura con cámara</h2>
           <p style="font-size:0.85rem; color:var(--muted); margin-top:0;">Centra el número dentro del recuadro punteado:</p>
@@ -139,7 +135,6 @@
         </div>
       </div>
 
-      <!-- COLUMNA DERECHA -->
       <div class="panel">
         <h2>Resultado de la Predicción</h2>
         <div id="res-placeholder" class="alert alert-info">
@@ -162,7 +157,6 @@
   </div>
 
   <script>
-    // --- LÓGICA DE PIZARRA (MOUSE + TÁCTIL) ---
     const canvas = document.getElementById("pizarra");
     const ctx = canvas.getContext("2d");
     let dibujando = false;
@@ -214,7 +208,6 @@
     canvas.addEventListener("touchmove", trazar, { passive: false });
     canvas.addEventListener("touchend", terminarTrazo);
 
-    // --- CAMBIO DE PESTAÑAS Y CONTROL DE CÁMARA ---
     let streamCamara = null;
 
     async function cambiarModo(modo, btn) {
@@ -228,7 +221,9 @@
 
       if (modo === "camara") {
         try {
-          streamCamara = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+          streamCamara = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } }
+          });
           document.getElementById("cam-video").srcObject = streamCamara;
         } catch (err) {
           alert("No se pudo acceder a la cámara. Verifica los permisos del navegador.");
@@ -239,38 +234,58 @@
       }
     }
 
-    // --- CARGA DE ARCHIVO ---
-    let imagenArchivoB64 = null;
+    // Reduce cualquier imagen/foto a máximo 220px antes de enviarla por red
+    function reducirImagen(imgElement, maxLado = 220) {
+      const w = imgElement.videoWidth || imgElement.naturalWidth || imgElement.width;
+      const h = imgElement.videoHeight || imgElement.naturalHeight || imgElement.height;
+      const escala = Math.min(1, maxLado / Math.max(w, h));
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(w * escala));
+      c.height = Math.max(1, Math.round(h * escala));
+      c.getContext("2d").drawImage(imgElement, 0, 0, c.width, c.height);
+      return c.toDataURL("image/jpeg", 0.85);
+    }
+
+    let imagenArchivoReducida = null;
     function cargarArchivo(e) {
       const file = e.target.files[0];
       if (!file) return;
       const reader = new FileReader();
       reader.onload = function(ev) {
-        imagenArchivoB64 = ev.target.result;
-        document.getElementById("img-preview").src = imagenArchivoB64;
-        document.getElementById("preview-wrap").classList.remove("hidden");
+        const imgTemp = new Image();
+        imgTemp.onload = function() {
+          imagenArchivoReducida = reducirImagen(imgTemp, 220);
+          document.getElementById("img-preview").src = imagenArchivoReducida;
+          document.getElementById("preview-wrap").classList.remove("hidden");
+        };
+        imgTemp.src = ev.target.result;
       };
       reader.readAsDataURL(file);
     }
 
-    // --- ENVIAR AL BACKEND ---
     async function enviarPrediccion(payload, btnId) {
       const btn = document.getElementById(btnId);
       const textoOrig = btn.innerText;
       btn.disabled = true;
       btn.innerText = "⏳ Procesando...";
 
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 25000);
+
       try {
         const res = await fetch("/predict", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(payload),
+          signal: controller.signal
         });
+        if (!res.ok) throw new Error("Error del servidor: " + res.status);
         const data = await res.json();
         mostrarResultado(data);
       } catch (err) {
-        alert("Error de conexión con el servidor.");
+        alert("El servidor tardó demasiado o se reinició. Intenta presionar Predecir nuevamente.");
       } finally {
+        clearTimeout(timeoutId);
         btn.disabled = false;
         btn.innerText = textoOrig;
       }
@@ -285,9 +300,9 @@
     }
 
     function predecirArchivo() {
-      if (!imagenArchivoB64) { alert("Selecciona primero una imagen."); return; }
+      if (!imagenArchivoReducida) { alert("Selecciona primero una imagen."); return; }
       enviarPrediccion({
-        image: imagenArchivoB64,
+        image: imagenArchivoReducida,
         es_dibujo: false,
         es_camara: false,
         modo_color: document.getElementById("modo-fondo").value
@@ -297,12 +312,8 @@
     function predecirCamara() {
       const video = document.getElementById("cam-video");
       if (!video.videoWidth) { alert("La cámara aún no está lista."); return; }
-      const tempCanvas = document.createElement("canvas");
-      tempCanvas.width = video.videoWidth;
-      tempCanvas.height = video.videoHeight;
-      tempCanvas.getContext("2d").drawImage(video, 0, 0);
       enviarPrediccion({
-        image: tempCanvas.toDataURL("image/jpeg", 0.9),
+        image: reducirImagen(video, 220),
         es_dibujo: false,
         es_camara: true,
         modo_color: "Automático"
