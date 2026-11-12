@@ -1,27 +1,20 @@
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # Ahorra ~90 MB de RAM en Render
 
-import streamlit as st
+import io
+import base64
+import numpy as np
 import tensorflow as tf
 from PIL import Image, ImageOps, ImageFilter
-import numpy as np
-from streamlit_drawable_canvas import st_canvas
+from flask import Flask, request, jsonify, send_file
 
-st.set_page_config(page_title="CNN MNIST", layout="wide")
+app = Flask(__name__)
 
-@st.cache_resource
-def load_cnn_model():
-    m = tf.keras.models.load_model("mi_modelo.h5", compile=False)
-    # Calentamiento inicial para evitar retraso en la primera predicción
-    _ = m(np.zeros((1, 28, 28, 1), dtype=np.float32), training=False)
-    return m
+# Cargar el modelo una sola vez y hacer calentamiento inicial
+model = tf.keras.models.load_model("mi_modelo.h5", compile=False)
+_ = model(np.zeros((1, 28, 28, 1), dtype=np.float32), training=False)
 
-model = load_cnn_model()
-
-if "canvas_key" not in st.session_state:
-    st.session_state.canvas_key = 0
-
-st.title("Reconocimiento de Dígitos MNIST")
 
 def calcular_otsu(gray_uint8):
     hist = np.bincount(gray_uint8.ravel(), minlength=256).astype(np.float64)
@@ -40,6 +33,7 @@ def calcular_otsu(gray_uint8):
     m_f[valid] = (sum_total - sum_b[valid]) / w_f[valid]
     var_between = w_b * w_f * ((m_b - m_f) ** 2)
     return int(np.argmax(var_between))
+
 
 def limpiar_componentes(img_np):
     h, w = img_np.shape
@@ -82,6 +76,7 @@ def limpiar_componentes(img_np):
 
     return mascara_limpia
 
+
 def preprocesar_mnist(image, modo_color="Automático", es_dibujo=False, es_camara=False):
     img_gray = ImageOps.grayscale(image)
 
@@ -93,7 +88,6 @@ def preprocesar_mnist(image, modo_color="Automático", es_dibujo=False, es_camar
         img_gray = img_gray.crop((izq, sup, izq + lado, sup + lado))
 
     if not es_dibujo:
-        # 56x56 acelera la limpieza 4.6x manteniendo alta precisión para el destino 28x28
         img_gray = img_gray.resize((56, 56), Image.Resampling.BILINEAR)
 
     img_np = np.array(img_gray, dtype=np.float32)
@@ -136,7 +130,6 @@ def preprocesar_mnist(image, modo_color="Automático", es_dibujo=False, es_camar
         pos_y = (28 - nuevo_alto) // 2
         img_28.paste(img_20, (pos_x, pos_y))
 
-        # Suavizado ligero y centrado por centro de masa (estándar MNIST)
         img_28 = img_28.filter(ImageFilter.GaussianBlur(radius=0.5))
         arr_28 = np.array(img_28, dtype=np.float32)
         max_28 = arr_28.max()
@@ -157,132 +150,86 @@ def preprocesar_mnist(image, modo_color="Automático", es_dibujo=False, es_camar
 
     return img_28
 
-opcion = st.radio(
-    "Selecciona el método de entrada:",
-    ["✍️ Pizarra Digital", "📁 Subir Imagen", "📸 Tomar Foto"],
-    horizontal=True
-)
 
-st.divider()
+@app.route("/")
+def index():
+    return send_file("index.html")
 
-col_izq, col_der = st.columns([1.1, 1], gap="large")
 
-imagen_para_predecir = None
-es_pizarra = False
-es_camara = False
-modo_fondo = "Automático"
+@app.route("/predict", methods=["POST"])
+def predict():
+    data = request.get_json(silent=True)
+    if not data or "image" not in data:
+        return jsonify({"error": "No se recibió ninguna imagen."}), 400
 
-with col_izq:
-    if opcion == "✍️ Pizarra Digital":
-        st.subheader("Dibuja un dígito (0-9)")
-        canvas_result = st_canvas(
-            fill_color="#000000",
-            stroke_width=28,
-            stroke_color="#FFFFFF",
-            background_color="#000000",
-            height=260,
-            width=260,
-            drawing_mode="freedraw",
-            return_image_data=True,
-            key=f"canvas_{st.session_state.canvas_key}",
-        )
+    try:
+        header, encoded = data["image"].split(",", 1)
+        img_bytes = base64.b64decode(encoded)
+        image = Image.open(io.BytesIO(img_bytes))
+    except Exception:
+        return jsonify({"error": "Formato de imagen inválido."}), 400
 
-        btn_col1, btn_col2 = st.columns(2)
-        with btn_col1:
-            predecir_btn = st.button("🔍 Predecir", type="primary", use_container_width=True)
-        with btn_col2:
-            if st.button("🗑️ Borrar pizarra", use_container_width=True):
-                st.session_state.canvas_key += 1
-                st.rerun()
+    es_dibujo = bool(data.get("es_dibujo", False))
+    es_camara = bool(data.get("es_camara", False))
+    modo_color = data.get("modo_color", "Automático")
 
-        if predecir_btn and canvas_result.image_data is not None:
-            imagen_para_predecir = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
-            es_pizarra = True
+    img_28 = preprocesar_mnist(
+        image,
+        modo_color=modo_color,
+        es_dibujo=es_dibujo,
+        es_camara=es_camara
+    )
 
-    elif opcion == "📁 Subir Imagen":
-        st.subheader("Sube una imagen")
-        uploaded_file = st.file_uploader("Formatos: PNG, JPG, JPEG", type=["png", "jpg", "jpeg"])
-        modo_fondo = st.selectbox(
-            "Tipo de fondo:",
-            ["Automático", "Fondo oscuro / número claro", "Fondo claro / número oscuro"]
-        )
-        if uploaded_file is not None:
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Imagen original", width=160)
-            if st.button("🔍 Predecir Imagen", type="primary", use_container_width=True):
-                imagen_para_predecir = image
+    img_array = np.array(img_28, dtype=np.float32) / 255.0
 
-    elif opcion == "📸 Tomar Foto":
-        st.subheader("Captura con cámara")
-        st.caption("Centra el número dentro del cuadro de la cámara antes de capturar.")
-        camera_file = st.camera_input("Enfoca el número")
-        if camera_file is not None:
-            image = Image.open(camera_file)
-            if st.button("🔍 Predecir Foto", type="primary", use_container_width=True):
-                imagen_para_predecir = image
-                es_camara = True
+    # Convertir la miniatura 28x28 a base64 para mostrarla en la web
+    buf = io.BytesIO()
+    img_28.save(buf, format="PNG")
+    img_28_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
-with col_der:
-    st.subheader("Resultado de la Predicción")
-    if imagen_para_predecir is not None:
-        img_28 = preprocesar_mnist(
-            imagen_para_predecir,
-            modo_color=modo_fondo,
-            es_dibujo=es_pizarra,
-            es_camara=es_camara
-        )
+    if np.max(img_array) == 0:
+        return jsonify({
+            "vacio": True,
+            "mensaje": "No se detectó ningún trazo. Dibuja o carga un número primero.",
+            "img_28": img_28_b64
+        })
 
-        img_array = np.array(img_28, dtype=np.float32) / 255.0
+    img_input = img_array.reshape(1, 28, 28, 1)
+    probs = model(img_input, training=False).numpy()[0]
 
-        # 1. Validar que la imagen no esté vacía
-        if np.max(img_array) == 0:
-            st.warning("⚠️ No se detectó ningún trazo. Dibuja o carga un número primero.")
-        else:
-            img_array = img_array.reshape(1, 28, 28, 1)
-            # Inferencia directa sin sobrecarga de dataset de Keras
-            prediccion = model(img_array, training=False).numpy()
-            probs = prediccion[0]
-            digito = int(np.argmax(probs))
-            confianza = float(np.max(probs)) * 100
+    digito = int(np.argmax(probs))
+    confianza = float(np.max(probs)) * 100.0
+    segunda_mejor = float(np.partition(probs, -2)[-2]) * 100.0
+    margen = confianza - segunda_mejor
 
-            # 2. Validación estricta contra trazos ambiguos o letras
-            segunda_mejor = float(np.partition(probs, -2)[-2]) * 100
-            margen = confianza - segunda_mejor
+    entropia = -float(np.sum(probs * np.log(probs + 1e-10)))
+    entropia_norm = entropia / float(np.log(10))
 
-            entropia = -np.sum(probs * np.log(probs + 1e-10))
-            entropia_norm = entropia / np.log(10)
+    es_digito_valido = True
+    mensaje_error = ""
 
-            es_digito_valido = True
-            mensaje_error = ""
+    if confianza < 90.0:
+        es_digito_valido = False
+        mensaje_error = "No se detectó un número válido (confianza insuficiente)"
+    elif margen < 25.0:
+        es_digito_valido = False
+        mensaje_error = "Entrada ambigua: no parece un dígito del 0 al 9 (margen bajo)"
+    elif entropia_norm > 0.35:
+        es_digito_valido = False
+        mensaje_error = "Entrada ambigua: patrón no corresponde a un dígito claro"
 
-            if confianza < 90.0:
-                es_digito_valido = False
-                mensaje_error = "❌ **No se detectó un número válido** (confianza insuficiente)"
-            elif margen < 25.0:
-                es_digito_valido = False
-                mensaje_error = "⚠️ **Entrada ambigua: no parece un dígito del 0 al 9** (margen bajo)"
-            elif entropia_norm > 0.35:
-                es_digito_valido = False
-                mensaje_error = "⚠️ **Entrada ambigua: patrón no corresponde a un dígito claro**"
+    return jsonify({
+        "vacio": False,
+        "es_valido": es_digito_valido,
+        "mensaje_error": mensaje_error,
+        "digito": digito,
+        "confianza": round(confianza, 2),
+        "margen": round(margen, 1),
+        "probabilidades": [round(float(p) * 100, 2) for p in probs],
+        "img_28": img_28_b64
+    })
 
-            res_c1, res_c2 = st.columns([1, 1.5])
-            with res_c1:
-                st.image(img_28, caption="Entrada (28x28 px)", width=130)
-            with res_c2:
-                if not es_digito_valido:
-                    st.error(mensaje_error)
-                    st.caption(f"Confianza máxima: {confianza:.1f}% | Margen vs 2da opción: {margen:.1f}%")
-                    st.info("💡 Intenta dibujar el número más claro, centrado y con trazo grueso.")
-                else:
-                    st.success(f"### Dígito detectado: **{digito}**")
-                    st.metric("Confianza", f"{confianza:.2f}%")
 
-            st.write("**Probabilidad por clase (0-9):**")
-            st.bar_chart(probs, height=180)
-
-            if not es_digito_valido:
-                with st.expander("🔍 Ver detalle de probabilidades (debug)"):
-                    for i, p in enumerate(probs):
-                        st.write(f"  {i}: {p * 100:.2f}%")
-    else:
-        st.info("Dibuja, sube una imagen o toma una foto a la izquierda y presiona **Predecir** para ver el resultado aquí.")
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
