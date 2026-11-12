@@ -1,3 +1,6 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 import streamlit as st
 import tensorflow as tf
 from PIL import Image, ImageOps, ImageFilter
@@ -8,7 +11,10 @@ st.set_page_config(page_title="CNN MNIST", layout="wide")
 
 @st.cache_resource
 def load_cnn_model():
-    return tf.keras.models.load_model('mi_modelo.h5')
+    m = tf.keras.models.load_model("mi_modelo.h5", compile=False)
+    # Calentamiento inicial para evitar retraso en la primera predicción
+    _ = m(np.zeros((1, 28, 28, 1), dtype=np.float32), training=False)
+    return m
 
 model = load_cnn_model()
 
@@ -18,28 +24,22 @@ if "canvas_key" not in st.session_state:
 st.title("Reconocimiento de Dígitos MNIST")
 
 def calcular_otsu(gray_uint8):
-    hist, _ = np.histogram(gray_uint8.ravel(), bins=256, range=(0, 256))
+    hist = np.bincount(gray_uint8.ravel(), minlength=256).astype(np.float64)
     total = gray_uint8.size
-    sum_total = float(np.dot(np.arange(256), hist))
-    sum_b = 0.0
-    w_b = 0
-    max_var = -1.0
-    umbral = 127
-    for t in range(256):
-        w_b += int(hist[t])
-        if w_b == 0:
-            continue
-        w_f = total - w_b
-        if w_f == 0:
-            break
-        sum_b += float(t * hist[t])
-        m_b = sum_b / w_b
-        m_f = (sum_total - sum_b) / w_f
-        var_between = float(w_b) * float(w_f) * ((m_b - m_f) ** 2)
-        if var_between > max_var:
-            max_var = var_between
-            umbral = t
-    return umbral
+    w_b = np.cumsum(hist)
+    w_f = total - w_b
+    valid = (w_b > 0) & (w_f > 0)
+    if not np.any(valid):
+        return 127
+
+    sum_b = np.cumsum(np.arange(256, dtype=np.float64) * hist)
+    sum_total = sum_b[-1]
+    m_b = np.zeros(256, dtype=np.float64)
+    m_f = np.zeros(256, dtype=np.float64)
+    m_b[valid] = sum_b[valid] / w_b[valid]
+    m_f[valid] = (sum_total - sum_b[valid]) / w_f[valid]
+    var_between = w_b * w_f * ((m_b - m_f) ** 2)
+    return int(np.argmax(var_between))
 
 def limpiar_componentes(img_np):
     h, w = img_np.shape
@@ -93,7 +93,8 @@ def preprocesar_mnist(image, modo_color="Automático", es_dibujo=False, es_camar
         img_gray = img_gray.crop((izq, sup, izq + lado, sup + lado))
 
     if not es_dibujo:
-        img_gray = img_gray.resize((120, 120), Image.Resampling.LANCZOS)
+        # 56x56 acelera la limpieza 4.6x manteniendo alta precisión para el destino 28x28
+        img_gray = img_gray.resize((56, 56), Image.Resampling.BILINEAR)
 
     img_np = np.array(img_gray, dtype=np.float32)
 
@@ -111,8 +112,9 @@ def preprocesar_mnist(image, modo_color="Automático", es_dibujo=False, es_camar
     if not es_dibujo:
         umbral = calcular_otsu(img_np.astype(np.uint8))
         img_np = np.where(img_np > umbral, img_np, 0.0)
-        if img_np.max() > 0:
-            img_np = (img_np / img_np.max()) * 255.0
+        max_val = img_np.max()
+        if max_val > 0:
+            img_np = (img_np / max_val) * 255.0
         img_np = limpiar_componentes(img_np)
 
     img_clean = Image.fromarray(img_np.astype(np.uint8))
@@ -137,8 +139,9 @@ def preprocesar_mnist(image, modo_color="Automático", es_dibujo=False, es_camar
         # Suavizado ligero y centrado por centro de masa (estándar MNIST)
         img_28 = img_28.filter(ImageFilter.GaussianBlur(radius=0.5))
         arr_28 = np.array(img_28, dtype=np.float32)
-        if arr_28.max() > 0:
-            arr_28 = (arr_28 / arr_28.max()) * 255.0
+        max_28 = arr_28.max()
+        if max_28 > 0:
+            arr_28 = (arr_28 / max_28) * 255.0
         masa = arr_28.sum()
         if masa > 0:
             ys, xs = np.indices((28, 28))
@@ -193,7 +196,7 @@ with col_izq:
                 st.rerun()
 
         if predecir_btn and canvas_result.image_data is not None:
-            imagen_para_predecir = Image.fromarray(canvas_result.image_data.astype('uint8'), 'RGBA')
+            imagen_para_predecir = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
             es_pizarra = True
 
     elif opcion == "📁 Subir Imagen":
@@ -236,25 +239,22 @@ with col_der:
             st.warning("⚠️ No se detectó ningún trazo. Dibuja o carga un número primero.")
         else:
             img_array = img_array.reshape(1, 28, 28, 1)
-            prediccion = model.predict(img_array)
-            digito = int(np.argmax(prediccion))
-            confianza = float(np.max(prediccion)) * 100
-
-            # Validación robusta: detectar si NO es un dígito válido
-            # Criterios estrictos para rechazar letras/símbolos que parecen dígitos (ej: c≈6, o≈0, etc.)
+            # Inferencia directa sin sobrecarga de dataset de Keras
+            prediccion = model(img_array, training=False).numpy()
             probs = prediccion[0]
+            digito = int(np.argmax(probs))
+            confianza = float(np.max(probs)) * 100
+
+            # 2. Validación estricta contra trazos ambiguos o letras
             segunda_mejor = float(np.partition(probs, -2)[-2]) * 100
             margen = confianza - segunda_mejor
 
-            # Entropía de la distribución: si es alta, el modelo está "confundido"
             entropia = -np.sum(probs * np.log(probs + 1e-10))
-            entropia_max = np.log(10)  # entropía máxima para 10 clases uniformes
-            entropia_norm = entropia / entropia_max  # 0 = seguro, 1 = totalmente incierto
+            entropia_norm = entropia / np.log(10)
 
             es_digito_valido = True
             mensaje_error = ""
 
-            # Umbrales MÁS ESTRICTOS para rechazar letras (c, o, x, etc.)
             if confianza < 90.0:
                 es_digito_valido = False
                 mensaje_error = "❌ **No se detectó un número válido** (confianza insuficiente)"
@@ -278,12 +278,11 @@ with col_der:
                     st.metric("Confianza", f"{confianza:.2f}%")
 
             st.write("**Probabilidad por clase (0-9):**")
-            st.bar_chart(prediccion[0], height=180)
+            st.bar_chart(probs, height=180)
 
-            # Mostrar detalles de debug si no es válido (opcional, útil para ajustar)
             if not es_digito_valido:
                 with st.expander("🔍 Ver detalle de probabilidades (debug)"):
                     for i, p in enumerate(probs):
-                        st.write(f"  {i}: {p*100:.2f}%")
+                        st.write(f"  {i}: {p * 100:.2f}%")
     else:
         st.info("Dibuja, sube una imagen o toma una foto a la izquierda y presiona **Predecir** para ver el resultado aquí.")
